@@ -248,14 +248,11 @@ async def get_keyword_counts(
     guild_id: str,
     keyword: str | None = None,
     author_id: str | None = None,
+    top_n: int = 5,
 ) -> list[dict]:
     """
-    查詢計數，支援四種組合：
-    - 全部
-    - 篩選 keyword
-    - 篩選 author_id
-    - 同時篩選
-    回傳 list[dict]，依 count DESC 排序。
+    各關鍵字前 top_n 名；指定 author_id 時改為列出該人所有關鍵字。
+    回傳 list[dict]，依 keyword → count DESC 排序。
     """
     conditions: list[str] = ["guild_id = ?"]
     params: list = [guild_id]
@@ -267,13 +264,31 @@ async def get_keyword_counts(
         params.append(author_id)
 
     where = " AND ".join(conditions)
-    sql = f"""
-        SELECT author_tag, author_id, keyword, count, last_seen_at
-        FROM keyword_counts
-        WHERE {where}
-        ORDER BY count DESC
-        LIMIT 25
-    """
+
+    if author_id is not None:
+        # 指定成員：直接列出該人所有關鍵字，不限名次
+        sql = f"""
+            SELECT author_tag, author_id, keyword, count, last_seen_at
+            FROM keyword_counts
+            WHERE {where}
+            ORDER BY count DESC
+            LIMIT 25
+        """
+    else:
+        # 每個關鍵字各取前 top_n 名（使用視窗函式）
+        params.append(top_n)
+        sql = f"""
+            SELECT author_tag, author_id, keyword, count, last_seen_at
+            FROM (
+                SELECT author_tag, author_id, keyword, count, last_seen_at,
+                       ROW_NUMBER() OVER (PARTITION BY keyword ORDER BY count DESC) AS rn
+                FROM keyword_counts
+                WHERE {where}
+            )
+            WHERE rn <= ?
+            ORDER BY keyword, count DESC
+        """
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(sql, params)
         rows = await cur.fetchall()
@@ -343,8 +358,11 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                 return None
 
             # 從 DOM 取得貼文清單，同時偵測置頂標記
-            raw: list[dict] = await page.evaluate(r"""
-                () => {
+            # 將 username 傳入 JS，只抓屬於該用戶的貼文連結
+            raw: list[dict] = await page.evaluate("""
+                (username) => {
+                    const userPattern = '/@' + username + '/post/';
+
                     function isPinned(linkEl) {
                         let el = linkEl;
                         for (let i = 0; i < 8; i++) {
@@ -370,7 +388,9 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                     const seen = new Set();
                     const results = [];
                     for (const link of document.querySelectorAll('a[href*="/post/"]')) {
-                        const m = link.href.match(/\/post\/([^/?#]+)/);
+                        // 只保留屬於此用戶的貼文連結，排除回覆、引用等其他用戶的連結
+                        if (!link.href.includes(userPattern)) continue;
+                        const m = link.href.match(/\\/post\\/([^/?#]+)/);
                         if (!m) continue;
                         const pid = m[1];
                         if (seen.has(pid)) continue;
@@ -380,7 +400,7 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                     }
                     return results;
                 }
-            """)
+            """, username)
 
             if not raw:
                 page_title = await page.title()
@@ -533,27 +553,42 @@ async def track_stats(
         return
 
     # 組成 embed
-    title_parts: list[str] = []
-    if kw_filter:
-        title_parts.append(f"關鍵字「{kw_filter}」")
     if user:
-        title_parts.append(f"@{user.display_name}")
-    title = "、".join(title_parts) + " 的統計" if title_parts else "關鍵字統計"
+        title = f"@{user.display_name} 的關鍵字統計"
+    elif kw_filter:
+        title = f"關鍵字「{kw_filter}」前 5 名"
+    else:
+        title = "各關鍵字前 5 名"
 
     embed = discord.Embed(title=title, color=0x5865F2)
 
-    lines: list[str] = []
-    for r in rows:
-        kw_str = f"`{r['keyword']}`"
-        who = f"**{r['author_tag']}**"
-        lines.append(f"{who} — {kw_str}：**{r['count']}** 次")
+    if user:
+        # 指定成員：單欄列出所有關鍵字
+        lines = [f"`{r['keyword']}`：**{r['count']}** 次" for r in rows]
+        chunk = "\n".join(lines)
+        if len(chunk) > 1020:
+            chunk = chunk[:1020] + "\n…"
+        embed.add_field(name="關鍵字次數", value=chunk, inline=False)
+    else:
+        # 依關鍵字分組，每個關鍵字一欄，列前 5 名
+        from collections import defaultdict
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for r in rows:
+            grouped[r["keyword"]].append(r)
 
-    # Discord embed value 上限 1024 字元
-    chunk = "\n".join(lines)
-    if len(chunk) > 1020:
-        chunk = chunk[:1020] + "\n…"
-    embed.add_field(name="排行（前 25）", value=chunk, inline=False)
-    embed.set_footer(text=f"共 {len(rows)} 筆")
+        for kw, members in grouped.items():
+            lines = []
+            for i, r in enumerate(members, 1):
+                lines.append(f"{i}. **{r['author_tag']}** — **{r['count']}** 次")
+            value = "\n".join(lines)
+            if len(value) > 1020:
+                value = value[:1020] + "\n…"
+            embed.add_field(name=f"🔑 {kw}", value=value, inline=True)
+
+        # Discord embed 最多 25 個 field，超過時提示
+        if len(grouped) > 25:
+            embed.set_footer(text=f"僅顯示前 25 個關鍵字")
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
