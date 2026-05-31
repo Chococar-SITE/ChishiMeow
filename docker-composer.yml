@@ -1,0 +1,28 @@
+services:
+  chishi-meow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chishi-meow
+    restart: unless-stopped
+ 
+    # ── 環境變數 ────────────────────────────────────────────────
+    # 敏感資料放 .env（不要 commit 進 git）
+    # 非敏感的設定可以直接寫在 environment 裡
+    env_file:
+      - .env
+    environment:
+      - AUTO_UPDATE=1
+      - BRANCH=main
+      - PY_FILE=bot.py
+      - REQUIREMENTS_FILE=requirements.txt
+      - INSTALL_PLAYWRIGHT=1
+ 
+    # ── 資料持久化 ──────────────────────────────────────────────
+    # /data 裡有：track.db、threads_cookies.json、playwright_browsers
+    volumes:
+      - chishi_data:/data
+ 
+volumes:
+  chishi_data:
+    name: chishi-meow-data
