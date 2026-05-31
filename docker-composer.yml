@@ -11,7 +11,10 @@ services:
       - PY_FILE=bot.py
       - REQUIREMENTS_FILE=requirements.txt
       - INSTALL_PLAYWRIGHT=1
-      # 敏感變數不寫在這裡，改在 Portainer 介面填入
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - THREADS_USERNAME=${THREADS_USERNAME}
+      - THREADS_CHANNEL_ID=${THREADS_CHANNEL_ID}
+      - DB_PATH=${DB_PATH}
 
 volumes:
   chishi_data:
