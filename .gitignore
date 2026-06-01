@@ -1,2 +1,4 @@
 .env*
 track.db
+CLAUDE.md
+__pycache__/

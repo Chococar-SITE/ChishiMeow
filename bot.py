@@ -363,6 +363,9 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                 (username) => {
                     const userPattern = '/@' + username + '/post/';
 
+                    // 置頂標籤可能的字串：英文 Pinned、zh-TW 實際用「釘選 / 已釘選」（非「置頂」）
+                    const PIN_LABELS = ['pinned', '置頂', '釘選', '已釘選'];
+
                     function isPinned(linkEl) {
                         let el = linkEl;
                         for (let i = 0; i < 8; i++) {
@@ -370,16 +373,18 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                             el = el.parentElement;
                             // 超過單篇容器就停
                             if (el.querySelectorAll('a[href*="/post/"]').length > 3) break;
-                            // 偵測 "Pinned" 文字節點
+                            // 偵測置頂文字節點（短標籤精確比對，避免誤判內文）
                             const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
                             let node;
                             while ((node = walker.nextNode())) {
-                                const t = node.textContent?.trim();
-                                if (t === 'Pinned' || t === '置頂') return true;
+                                const t = (node.textContent || '').trim().toLowerCase();
+                                if (t && PIN_LABELS.includes(t)) return true;
                             }
-                            // 偵測 aria-label
-                            for (const a of el.querySelectorAll('[aria-label]')) {
-                                if (a.getAttribute('aria-label').toLowerCase().includes('pin')) return true;
+                            // 偵測 aria-label / title（圖示型置頂標記）
+                            for (const a of el.querySelectorAll('[aria-label], [title]')) {
+                                const label = ((a.getAttribute('aria-label') || '') + ' ' +
+                                               (a.getAttribute('title') || '')).toLowerCase();
+                                if (PIN_LABELS.some(k => label.includes(k))) return true;
                             }
                         }
                         return false;
