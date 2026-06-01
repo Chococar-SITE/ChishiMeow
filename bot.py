@@ -321,8 +321,8 @@ def now_iso() -> str:
 
 async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
     """
-    使用 Playwright 抓取 Threads 公開個人頁面的最新貼文（前 5 則）。
-    回傳 [{"post_id": str, "url": str, "text": str}, ...] 或 None（失敗時）。
+    使用 Playwright 抓取 Threads 公開個人頁面的最新貼文（前 10 則）。
+    回傳 [{"post_id", "url", "pinned", "text", "image"}, ...] 或 None（失敗時）。
     回傳多則是為了跳過置頂貼文。
     """
     profile_url = f"https://www.threads.net/@{username}"
@@ -365,29 +365,68 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
 
                     // 置頂標籤可能的字串：英文 Pinned、zh-TW 實際用「釘選 / 已釘選」（非「置頂」）
                     const PIN_LABELS = ['pinned', '置頂', '釘選', '已釘選'];
+                    // 大頭貼 alt 文字（各語系），用來排除頭像圖片
+                    const AVATAR_HINTS = ['profile picture', '大頭貼', '頭像', '個人檔案'];
 
-                    function isPinned(linkEl) {
+                    // 從貼文連結往上找出「單篇貼文容器」：往上爬，直到祖先包含過多 /post/ 連結為止
+                    function postContainer(linkEl) {
                         let el = linkEl;
+                        let best = linkEl;
                         for (let i = 0; i < 8; i++) {
                             if (!el.parentElement) break;
                             el = el.parentElement;
-                            // 超過單篇容器就停
                             if (el.querySelectorAll('a[href*="/post/"]').length > 3) break;
-                            // 偵測置頂文字節點（短標籤精確比對，避免誤判內文）
-                            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-                            let node;
-                            while ((node = walker.nextNode())) {
-                                const t = (node.textContent || '').trim().toLowerCase();
-                                if (t && PIN_LABELS.includes(t)) return true;
-                            }
-                            // 偵測 aria-label / title（圖示型置頂標記）
-                            for (const a of el.querySelectorAll('[aria-label], [title]')) {
-                                const label = ((a.getAttribute('aria-label') || '') + ' ' +
-                                               (a.getAttribute('title') || '')).toLowerCase();
-                                if (PIN_LABELS.some(k => label.includes(k))) return true;
-                            }
+                            best = el;
+                        }
+                        return best;
+                    }
+
+                    function isPinned(container) {
+                        // 偵測置頂文字節點（短標籤精確比對，避免誤判內文）
+                        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            const t = (node.textContent || '').trim().toLowerCase();
+                            if (t && PIN_LABELS.includes(t)) return true;
+                        }
+                        // 偵測 aria-label / title（圖示型置頂標記）
+                        for (const a of container.querySelectorAll('[aria-label], [title]')) {
+                            const label = ((a.getAttribute('aria-label') || '') + ' ' +
+                                           (a.getAttribute('title') || '')).toLowerCase();
+                            if (PIN_LABELS.some(k => label.includes(k))) return true;
                         }
                         return false;
+                    }
+
+                    // 取貼文內文：Threads 內文多以 [dir="auto"] 呈現，取最長的葉節點區塊
+                    function extractText(container) {
+                        let leaf = '', any = '';
+                        for (const el of container.querySelectorAll('[dir="auto"]')) {
+                            const t = (el.innerText || '').trim();
+                            if (t.length > any.length) any = t;
+                            if (el.querySelector('[dir="auto"]')) continue;  // 跳過外層包裝，偏好葉節點
+                            if (t.length > leaf.length) leaf = t;
+                        }
+                        return leaf || any;
+                    }
+
+                    // 取縮圖：略過頭像，挑面積最大的貼文圖片；無圖時退而取影片封面
+                    function extractImage(container) {
+                        let best = null, bestArea = 0;
+                        for (const img of container.querySelectorAll('img')) {
+                            const alt = (img.alt || '').toLowerCase();
+                            if (AVATAR_HINTS.some(k => alt.includes(k))) continue;
+                            const w = img.naturalWidth || img.width || 0;
+                            const h = img.naturalHeight || img.height || 0;
+                            if (w < 200) continue;  // 過濾頭像等小圖
+                            const area = w * h;
+                            if (area > bestArea) { bestArea = area; best = img.currentSrc || img.src; }
+                        }
+                        if (!best) {
+                            const v = container.querySelector('video[poster]');
+                            if (v) best = v.getAttribute('poster');
+                        }
+                        return best;
                     }
 
                     const seen = new Set();
@@ -400,7 +439,13 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                         const pid = m[1];
                         if (seen.has(pid)) continue;
                         seen.add(pid);
-                        results.push({ pid, pinned: isPinned(link) });
+                        const container = postContainer(link);
+                        results.push({
+                            pid,
+                            pinned: isPinned(container),
+                            text: extractText(container),
+                            image: extractImage(container),
+                        });
                         if (results.length >= 10) break;
                     }
                     return results;
@@ -415,10 +460,14 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
             results: list[dict] = []
             for item in raw:
                 pid: str = item["pid"]
-                pinned: bool = item["pinned"]
-                # 過濾掉非此用戶的貼文（若有的話）
                 clean_url = f"https://www.threads.com/@{username}/post/{pid}"
-                results.append({"post_id": pid, "url": clean_url, "pinned": pinned})
+                results.append({
+                    "post_id": pid,
+                    "url": clean_url,
+                    "pinned": item["pinned"],
+                    "text": (item.get("text") or "").strip(),
+                    "image": item.get("image") or None,
+                })
 
             pinned_ids = [r["post_id"] for r in results if r["pinned"]]
             print(f"[Threads] 共 {len(results)} 則，置頂：{pinned_ids}")
@@ -429,6 +478,31 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
             return None
         finally:
             await browser.close()
+
+
+# ---------- Threads Embed ----------
+
+# 內文預覽長度上限（Discord embed description 最多 4096，這裡僅取預覽）
+THREADS_PREVIEW_LIMIT = 1000
+
+
+def build_threads_embed(post: dict, *, title: str, footer: str) -> discord.Embed:
+    """依貼文資料組成 Discord embed：標題連結 + 內文預覽 + 大圖。"""
+    embed = discord.Embed(title=title, url=post["url"], color=0x000000)
+
+    text = (post.get("text") or "").strip()
+    if text:
+        if len(text) > THREADS_PREVIEW_LIMIT:
+            text = text[:THREADS_PREVIEW_LIMIT].rstrip() + "…"
+        embed.description = text
+
+    image = post.get("image")
+    if image:
+        embed.set_image(url=image)
+
+    embed.set_footer(text=footer)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
 
 
 # ---------- Background Task ----------
@@ -472,13 +546,11 @@ async def check_threads_task():
             return
 
         for post in notify_posts:
-            embed = discord.Embed(
+            embed = build_threads_embed(
+                post,
                 title=f"@{THREADS_USERNAME} 發布了新貼文",
-                url=post["url"],
-                color=0x000000,
+                footer="Threads · 自動偵測",
             )
-            embed.set_footer(text="Threads · 自動偵測")
-            embed.timestamp = datetime.now(timezone.utc)
             await channel.send(embed=embed)
 
         print(f"[Threads] @{THREADS_USERNAME} 發送了 {len(notify_posts)} 則新貼文通知（略過置頂 {len(new_posts) - len(notify_posts)} 則）")
@@ -685,7 +757,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="🧵 Threads 監控",
         value=(
             f"`/threads_check` — 立即查詢 @{THREADS_USERNAME or '（未設定）'} 的最新貼文\n"
-            "每 10 分鐘自動偵測一次，有新貼文時發送通知\n"
+            "每 10 分鐘自動偵測一次，有新貼文時發送通知（含內文預覽與大圖）\n"
             "監控對象與通知頻道設定於 `.env`"
         ),
         inline=False,
@@ -721,13 +793,11 @@ async def threads_check(interaction: discord.Interaction):
     else:
         post = posts[0]  # 全是置頂時 fallback
 
-    embed = discord.Embed(
+    embed = build_threads_embed(
+        post,
         title=f"@{THREADS_USERNAME} 的最新貼文",
-        url=post["url"],
-        color=0x000000,
+        footer="Threads · 手動查詢",
     )
-    embed.set_footer(text="Threads · 手動查詢")
-    embed.timestamp = datetime.now(timezone.utc)
     await interaction.followup.send(embed=embed)
 
 
