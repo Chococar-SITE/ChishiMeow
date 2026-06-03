@@ -68,6 +68,12 @@ async def init_db():
         )
         """)
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS keyword_counts (
             guild_id    TEXT,
             author_id   TEXT,
@@ -183,6 +189,38 @@ async def add_threads_seen_ids(username: str, new_ids: list[str]):
             (json.dumps(trimmed, ensure_ascii=False), username),
         )
         await db.commit()
+
+
+# ── settings helpers ──
+
+THREADS_NOTIFY_ROLE_KEY = "threads_notify_role"
+
+
+async def get_setting(key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def set_setting(key: str, value: str | None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if value is None:
+            await db.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                (key, value),
+            )
+        await db.commit()
+
+
+async def get_threads_notify_content() -> tuple[str | None, discord.AllowedMentions]:
+    """回傳 (要標記的身分組文字, AllowedMentions)；未設定時為 (None, 不標記)。"""
+    role_id = await get_setting(THREADS_NOTIFY_ROLE_KEY)
+    if role_id:
+        return f"<@&{role_id}>", discord.AllowedMentions(roles=True)
+    return None, discord.AllowedMentions.none()
 
 
 # ── keyword count helpers ──
@@ -545,13 +583,14 @@ async def check_threads_task():
             print(f"[Threads] 找不到頻道 {THREADS_CHANNEL_ID}")
             return
 
+        content, allowed = await get_threads_notify_content()
         for post in notify_posts:
             embed = build_threads_embed(
                 post,
                 title=f"@{THREADS_USERNAME} 發布了新貼文",
                 footer="Threads · 自動偵測",
             )
-            await channel.send(embed=embed)
+            await channel.send(content=content, embed=embed, allowed_mentions=allowed)
 
         print(f"[Threads] @{THREADS_USERNAME} 發送了 {len(notify_posts)} 則新貼文通知（略過置頂 {len(new_posts) - len(notify_posts)} 則）")
 
@@ -757,6 +796,9 @@ async def help_cmd(interaction: discord.Interaction):
         name="🧵 Threads 監控",
         value=(
             f"`/threads_check` — 立即查詢 @{THREADS_USERNAME or '（未設定）'} 的最新貼文\n"
+            "`/threads_role_set <role>` — 設定發布通知標記的身分組\n"
+            "`/threads_role_clear` — 取消標記身分組\n"
+            "`/threads_role_show` — 顯示目前標記的身分組\n"
             "每 10 分鐘自動偵測一次，有新貼文時發送通知（含內文預覽與大圖）\n"
             "監控對象與通知頻道設定於 `.env`"
         ),
@@ -799,6 +841,39 @@ async def threads_check(interaction: discord.Interaction):
         footer="Threads · 手動查詢",
     )
     await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="threads_role_set", description="設定發布通知時要標記的身分組")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(role="新貼文通知時要標記的身分組")
+async def threads_role_set(interaction: discord.Interaction, role: discord.Role):
+    await set_setting(THREADS_NOTIFY_ROLE_KEY, str(role.id))
+    await interaction.response.send_message(
+        f"已設定發布通知標記身分組：{role.mention}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="threads_role_clear", description="取消發布通知標記身分組")
+@app_commands.default_permissions(administrator=True)
+async def threads_role_clear(interaction: discord.Interaction):
+    await set_setting(THREADS_NOTIFY_ROLE_KEY, None)
+    await interaction.response.send_message("已取消發布通知的身分組標記。", ephemeral=True)
+
+
+@tree.command(name="threads_role_show", description="顯示目前發布通知標記的身分組")
+@app_commands.default_permissions(administrator=True)
+async def threads_role_show(interaction: discord.Interaction):
+    role_id = await get_setting(THREADS_NOTIFY_ROLE_KEY)
+    if not role_id:
+        await interaction.response.send_message("目前未設定發布通知標記身分組。", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"目前發布通知會標記：<@&{role_id}>",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 # ---------- Events ----------
