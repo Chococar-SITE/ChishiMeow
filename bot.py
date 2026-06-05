@@ -360,7 +360,7 @@ def now_iso() -> str:
 async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
     """
     使用 Playwright 抓取 Threads 公開個人頁面的最新貼文（前 10 則）。
-    回傳 [{"post_id", "url", "pinned", "text", "image"}, ...] 或 None（失敗時）。
+    回傳 [{"post_id", "url", "pinned", "text", "images"}, ...] 或 None（失敗時）。
     回傳多則是為了跳過置頂貼文。
     """
     profile_url = f"https://www.threads.net/@{username}"
@@ -436,6 +436,19 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                         return false;
                     }
 
+                    // 翻譯鈕標籤（各語系）：內文擷取時需排除，避免把按鈕「翻譯」抓進內文
+                    const TRANSLATE_LABELS = ['翻譯', '翻译', 'translate', '查看翻譯', '顯示翻譯', 'see translation'];
+
+                    // 容器內是否有「翻譯」按鈕（葉節點且文字剛好等於翻譯標籤）
+                    function hasTranslateButton(container) {
+                        for (const b of container.querySelectorAll('*')) {
+                            if (b.children.length) continue;            // 只看葉節點
+                            const bt = (b.textContent || '').trim().toLowerCase();
+                            if (TRANSLATE_LABELS.includes(bt)) return true;
+                        }
+                        return false;
+                    }
+
                     // 取貼文內文：Threads 內文多以 [dir="auto"] 呈現，取最長的葉節點區塊
                     function extractText(container) {
                         let leaf = '', any = '';
@@ -445,26 +458,41 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                             if (el.querySelector('[dir="auto"]')) continue;  // 跳過外層包裝，偏好葉節點
                             if (t.length > leaf.length) leaf = t;
                         }
-                        return leaf || any;
+                        let out = leaf || any;
+                        // 內文尾端若被一併抓進「翻譯」按鈕字樣，且容器確有翻譯鈕，則移除
+                        if (out) {
+                            const low = out.toLowerCase();
+                            for (const lbl of TRANSLATE_LABELS) {
+                                if (low.endsWith(lbl) && hasTranslateButton(container)) {
+                                    out = out.slice(0, out.length - lbl.length).trim();
+                                    break;
+                                }
+                            }
+                        }
+                        return out;
                     }
 
-                    // 取縮圖：略過頭像，挑面積最大的貼文圖片；無圖時退而取影片封面
-                    function extractImage(container) {
-                        let best = null, bestArea = 0;
+                    // 取貼文圖片：略過頭像，依出現順序收集大圖（去重），最多 4 張（Discord 圖庫上限）；無圖時退而取影片封面
+                    function extractImages(container) {
+                        const urls = [];
+                        const seenUrl = new Set();
                         for (const img of container.querySelectorAll('img')) {
                             const alt = (img.alt || '').toLowerCase();
                             if (AVATAR_HINTS.some(k => alt.includes(k))) continue;
                             const w = img.naturalWidth || img.width || 0;
-                            const h = img.naturalHeight || img.height || 0;
                             if (w < 200) continue;  // 過濾頭像等小圖
-                            const area = w * h;
-                            if (area > bestArea) { bestArea = area; best = img.currentSrc || img.src; }
+                            const src = img.currentSrc || img.src;
+                            if (!src || seenUrl.has(src)) continue;
+                            seenUrl.add(src);
+                            urls.push(src);
+                            if (urls.length >= 4) break;
                         }
-                        if (!best) {
+                        if (urls.length === 0) {
                             const v = container.querySelector('video[poster]');
-                            if (v) best = v.getAttribute('poster');
+                            const poster = v && v.getAttribute('poster');
+                            if (poster) urls.push(poster);
                         }
-                        return best;
+                        return urls;
                     }
 
                     const seen = new Set();
@@ -482,7 +510,7 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                             pid,
                             pinned: isPinned(container),
                             text: extractText(container),
-                            image: extractImage(container),
+                            images: extractImages(container),
                         });
                         if (results.length >= 10) break;
                     }
@@ -504,7 +532,7 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
                     "url": clean_url,
                     "pinned": item["pinned"],
                     "text": (item.get("text") or "").strip(),
-                    "image": item.get("image") or None,
+                    "images": item.get("images") or [],
                 })
 
             pinned_ids = [r["post_id"] for r in results if r["pinned"]]
@@ -524,8 +552,11 @@ async def fetch_latest_threads_posts(username: str) -> list[dict] | None:
 THREADS_PREVIEW_LIMIT = 1000
 
 
-def build_threads_embed(post: dict, *, title: str, footer: str) -> discord.Embed:
-    """依貼文資料組成 Discord embed：標題連結 + 內文預覽 + 大圖。"""
+def build_threads_embeds(post: dict, *, title: str, footer: str) -> list[discord.Embed]:
+    """依貼文資料組成 Discord embed 清單：標題連結 + 內文預覽 + 圖片。
+
+    多圖時利用「多個 embed 共用同一 url」讓 Discord 併成單一圖庫（最多 4 張）。
+    """
     embed = discord.Embed(title=title, url=post["url"], color=0x000000)
 
     text = (post.get("text") or "").strip()
@@ -534,13 +565,21 @@ def build_threads_embed(post: dict, *, title: str, footer: str) -> discord.Embed
             text = text[:THREADS_PREVIEW_LIMIT].rstrip() + "…"
         embed.description = text
 
-    image = post.get("image")
-    if image:
-        embed.set_image(url=image)
-
     embed.set_footer(text=footer)
     embed.timestamp = datetime.now(timezone.utc)
-    return embed
+
+    images = post.get("images") or []
+    if not images:
+        return [embed]
+
+    embed.set_image(url=images[0])
+    embeds = [embed]
+    # 其餘圖片：以相同 url 的額外 embed 串成圖庫（Discord 上限 4 張）
+    for img in images[1:4]:
+        extra = discord.Embed(url=post["url"], color=0x000000)
+        extra.set_image(url=img)
+        embeds.append(extra)
+    return embeds
 
 
 # ---------- Background Task ----------
@@ -585,12 +624,12 @@ async def check_threads_task():
 
         content, allowed = await get_threads_notify_content()
         for post in notify_posts:
-            embed = build_threads_embed(
+            embeds = build_threads_embeds(
                 post,
                 title=f"@{THREADS_USERNAME} 發布了新貼文",
                 footer="Threads · 自動偵測",
             )
-            await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+            await channel.send(content=content, embeds=embeds, allowed_mentions=allowed)
 
         print(f"[Threads] @{THREADS_USERNAME} 發送了 {len(notify_posts)} 則新貼文通知（略過置頂 {len(new_posts) - len(notify_posts)} 則）")
 
@@ -835,12 +874,12 @@ async def threads_check(interaction: discord.Interaction):
     else:
         post = posts[0]  # 全是置頂時 fallback
 
-    embed = build_threads_embed(
+    embeds = build_threads_embeds(
         post,
         title=f"@{THREADS_USERNAME} 的最新貼文",
         footer="Threads · 手動查詢",
     )
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embeds=embeds)
 
 
 @tree.command(name="threads_role_set", description="設定發布通知時要標記的身分組")
