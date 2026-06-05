@@ -176,13 +176,12 @@ async def init_threads_state(username: str, ids: list[str]):
 async def add_threads_seen_ids(username: str, new_ids: list[str]):
     state = await get_threads_state(username)
     existing: list[str] = state["seen_ids"]
-    existing_set = set(existing)
-    # 新 ID 依序追加到尾端（保留插入順序，不重複）
-    for nid in new_ids:
-        if nid not in existing_set:
-            existing.append(nid)
-            existing_set.add(nid)
-    trimmed = existing[-50:]  # 取最後 50 筆（最新的），順序確定
+    # 本輪抓到的 id 一律移到尾端刷新最近度：避免仍在頁面上的貼文（含置頂）
+    # 被 50 筆視窗淘汰後、又因 pin 偵測 miss 而重新誤判為新貼文
+    new_set = set(new_ids)
+    kept = [i for i in existing if i not in new_set]
+    refreshed = kept + list(new_ids)
+    trimmed = refreshed[-50:]  # 取最後 50 筆（最新的），順序確定
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE threads_state SET seen_ids=? WHERE username=?",
