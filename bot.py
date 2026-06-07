@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import subprocess
 from datetime import datetime, timezone
 import discord
 from discord import app_commands
@@ -19,6 +20,24 @@ DB_PATH              = os.getenv("DB_PATH", "./track.db")
 THREADS_USERNAME     = os.getenv("THREADS_USERNAME", "")
 THREADS_CHANNEL_ID   = os.getenv("THREADS_CHANNEL_ID", "")
 THREADS_COOKIES_PATH = os.getenv("THREADS_COOKIES_PATH", "./threads_cookies.json")
+STARTUP_CHANNEL_ID   = os.getenv("STARTUP_CHANNEL_ID", "")  # 開機訊息頻道（settings 可覆寫）
+
+
+def _detect_version() -> str:
+    """取得目前 git commit short SHA 作為版本號（除錯用）；非 git 環境回傳 'unknown'。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        sha = result.stdout.strip()
+        return sha if result.returncode == 0 and sha else "unknown"
+    except Exception:
+        return "unknown"
+
+
+VERSION = _detect_version()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -193,6 +212,7 @@ async def add_threads_seen_ids(username: str, new_ids: list[str]):
 # ── settings helpers ──
 
 THREADS_NOTIFY_ROLE_KEY = "threads_notify_role"
+STARTUP_CHANNEL_KEY     = "startup_channel"
 
 
 async def get_setting(key: str) -> str | None:
@@ -220,6 +240,14 @@ async def get_threads_notify_content() -> tuple[str | None, discord.AllowedMenti
     if role_id:
         return f"<@&{role_id}>", discord.AllowedMentions(roles=True)
     return None, discord.AllowedMentions.none()
+
+
+async def get_startup_channel_id() -> str | None:
+    """開機訊息頻道：settings 設定優先，未設定時退回 .env 的 STARTUP_CHANNEL_ID。"""
+    cid = await get_setting(STARTUP_CHANNEL_KEY)
+    if cid:
+        return cid
+    return STARTUP_CHANNEL_ID or None
 
 
 # ── keyword count helpers ──
@@ -842,6 +870,17 @@ async def help_cmd(interaction: discord.Interaction):
         ),
         inline=False,
     )
+    embed.add_field(
+        name="🔔 開機訊息",
+        value=(
+            "`/startup_channel_set <channel>` — 設定開機訊息發送的頻道\n"
+            "`/startup_channel_clear` — 取消開機訊息頻道設定\n"
+            "`/startup_channel_show` — 顯示目前開機訊息頻道\n"
+            "Bot 上線時會在此頻道發送含版本號的上線訊息"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"版本：{VERSION}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -914,6 +953,45 @@ async def threads_role_show(interaction: discord.Interaction):
     )
 
 
+# ---------- Slash Commands — 開機訊息頻道 ----------
+
+@tree.command(name="startup_channel_set", description="設定開機訊息發送的頻道")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(channel="開機訊息要發送到的頻道")
+async def startup_channel_set(interaction: discord.Interaction, channel: discord.TextChannel):
+    await set_setting(STARTUP_CHANNEL_KEY, str(channel.id))
+    await interaction.response.send_message(
+        f"已設定開機訊息頻道：{channel.mention}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@tree.command(name="startup_channel_clear", description="取消開機訊息頻道設定")
+@app_commands.default_permissions(administrator=True)
+async def startup_channel_clear(interaction: discord.Interaction):
+    await set_setting(STARTUP_CHANNEL_KEY, None)
+    await interaction.response.send_message(
+        "已取消開機訊息頻道設定（將改用 `.env` 的 `STARTUP_CHANNEL_ID`，若未設定則不發送）。",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="startup_channel_show", description="顯示目前開機訊息頻道")
+@app_commands.default_permissions(administrator=True)
+async def startup_channel_show(interaction: discord.Interaction):
+    cid = await get_startup_channel_id()
+    if not cid:
+        await interaction.response.send_message("目前未設定開機訊息頻道。", ephemeral=True)
+        return
+    source = "settings" if await get_setting(STARTUP_CHANNEL_KEY) else ".env"
+    await interaction.response.send_message(
+        f"目前開機訊息頻道：<#{cid}>（來源：{source}）",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 # ---------- Events ----------
 
 @client.event
@@ -969,14 +1047,41 @@ async def on_message(message: discord.Message):
     )
 
 
+async def send_startup_message():
+    """開機後發送上線訊息（含版本號）到設定的頻道；未設定或頻道無效時略過。"""
+    cid = await get_startup_channel_id()
+    if not cid:
+        return
+    try:
+        channel = client.get_channel(int(cid))
+    except (ValueError, TypeError):
+        print(f"[開機訊息] 頻道 ID 無效：{cid!r}")
+        return
+    if not isinstance(channel, discord.TextChannel):
+        print(f"[開機訊息] 找不到頻道 {cid}")
+        return
+    embed = discord.Embed(
+        title="千島神社的小精靈已上線",
+        description=f"版本：`{VERSION}`",
+        color=0x57F287,
+    )
+    embed.timestamp = datetime.now(timezone.utc)
+    try:
+        await channel.send(embed=embed)
+        print(f"[開機訊息] 已發送至頻道 {cid}")
+    except discord.DiscordException as e:
+        print(f"[開機訊息] 發送失敗：{e}")
+
+
 @client.event
 async def on_ready():
     await init_db()
     await tree.sync()
     if not check_threads_task.is_running():
         check_threads_task.start()
-    print(f"Logged in as {client.user}  (ID: {client.user.id})")  # type: ignore[union-attr]
+    print(f"Logged in as {client.user}  (ID: {client.user.id})  版本：{VERSION}")  # type: ignore[union-attr]
     print("------")
+    await send_startup_message()
 
 
 client.run(TOKEN)
