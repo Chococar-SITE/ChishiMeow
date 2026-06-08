@@ -611,6 +611,11 @@ def build_threads_embeds(post: dict, *, title: str, footer: str) -> list[discord
 
 # ---------- Background Task ----------
 
+# 每輪通知上限：抓取連續失敗造成盲窗，恢復後可能一次累積多則新貼文。
+# 只發最新者，其餘已由 add_threads_seen_ids 標記已讀、不再補發，避免一次爆量。
+THREADS_MAX_NOTIFY_PER_POLL = 1
+
+
 @tasks.loop(minutes=10)
 async def check_threads_task():
     if not THREADS_USERNAME or not THREADS_CHANNEL_ID:
@@ -639,9 +644,13 @@ async def check_threads_task():
             return  # 沒有新貼文
 
         # 優先通知非置頂；若新貼文全是置頂（罕見），仍全數通知以免漏報
+        # 貼文順序由新到舊，故第一則為最新
         notify_posts = [p for p in new_posts if not p["pinned"]] or new_posts
+        skipped_pinned = len(new_posts) - len(notify_posts)
+        capped = notify_posts[:THREADS_MAX_NOTIFY_PER_POLL]
+        dropped = len(notify_posts) - len(capped)
 
-        # 先更新 seen（含置頂），再發通知（避免重複通知）
+        # 先更新 seen（含置頂與被封頂略過者），再發通知（避免重複通知）
         await add_threads_seen_ids(THREADS_USERNAME, fetched_ids)
 
         channel = client.get_channel(int(THREADS_CHANNEL_ID))
@@ -650,7 +659,7 @@ async def check_threads_task():
             return
 
         content, allowed = await get_threads_notify_content()
-        for post in notify_posts:
+        for post in capped:
             embeds = build_threads_embeds(
                 post,
                 title=f"@{THREADS_USERNAME} 發布了新貼文",
@@ -658,7 +667,7 @@ async def check_threads_task():
             )
             await channel.send(content=content, embeds=embeds, allowed_mentions=allowed)
 
-        print(f"[Threads] @{THREADS_USERNAME} 發送了 {len(notify_posts)} 則新貼文通知（略過置頂 {len(new_posts) - len(notify_posts)} 則）")
+        print(f"[Threads] @{THREADS_USERNAME} 發送了 {len(capped)} 則新貼文通知（略過置頂 {skipped_pinned} 則、封頂略過 {dropped} 則）")
 
     except Exception as e:
         print(f"[Threads] 背景檢查失敗：{e}")
